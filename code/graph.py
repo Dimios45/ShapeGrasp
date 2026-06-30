@@ -120,9 +120,10 @@ def draw_shapes_on_image(img, hulls, output_dir, object_name, eps):
     if len(img.shape) == 2 or img.shape[2] == 1:
         img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
 
+    vt = _vol_thresh(hulls)
     for hull in hulls:
         hull_vs = np.array(hull.points[hull.vertices]).astype(np.int32)
-        if hull.volume < 500:
+        if hull.volume < vt:
             continue
         epsilon = eps * cv2.arcLength(hull_vs, True)
         approx = cv2.approxPolyDP(hull_vs, epsilon, True)
@@ -264,6 +265,14 @@ def create_custom_ellipse(points):
     return (center, axis_length, angle)
 
 
+def _vol_thresh(hulls):
+    """Adaptive volume threshold: scales down for small/low-res renders."""
+    if not hulls:
+        return 500
+    avg_vol = sum(h.volume for h in hulls) / len(hulls)
+    return min(500, max(5, avg_vol * 0.1))
+
+
 def create_graph(hulls, output_dir, obj_data_path, mode, eps):
     # with open(os.path.join(output_dir, f'{object_name}_2d_hulls.pkl'), 'rb') as f:
     #     hulls = pickle.load(f)
@@ -283,9 +292,10 @@ def create_graph(hulls, output_dir, obj_data_path, mode, eps):
     # Apply the mask to the image
     rgb_img = cv2.bitwise_and(rgb_img, rgb_img, mask=binary_mask.astype(np.uint8)*255)
     cv2.imwrite(output_dir+f'/{object_name}_masked_rgb.png', cv2.cvtColor(rgb_img, cv2.COLOR_RGB2BGR))
+    vt = _vol_thresh(hulls)
     G = nx.Graph()
     for idx, hull in enumerate(hulls):
-        if hull.volume < 500:
+        if hull.volume < vt:
             continue
         hull_vs = np.array(hull.points[hull.vertices]).astype(np.int32)
         epsilon = eps * cv2.arcLength(hull_vs, True)
@@ -329,7 +339,7 @@ def create_graph(hulls, output_dir, obj_data_path, mode, eps):
                 
     node_names = list(G.nodes)
     for i in range(len(hulls)):
-        if hulls[i].volume < 500:
+        if hulls[i].volume < vt:
             continue
         hull_vs = np.array(hulls[i].points[hulls[i].vertices]).astype(np.int32)
         epsilon = eps * cv2.arcLength(hull_vs, True)
@@ -337,7 +347,7 @@ def create_graph(hulls, output_dir, obj_data_path, mode, eps):
         if len(approx) < 3:
             continue
         for j in range(i+1, len(hulls)):
-            if hulls[j].volume < 500:
+            if hulls[j].volume < vt:
                 continue
             hull_vs = np.array(hulls[j].points[hulls[j].vertices]).astype(np.int32)
             epsilon = eps * cv2.arcLength(hull_vs, True)

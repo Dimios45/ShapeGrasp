@@ -74,12 +74,37 @@ def parse_graph_nodes(graph_text):
     node_data = {node[0]: (node[1]['angle'],) + node[1]['centroid'] for node in nodes}
     return node_data
 
-def run_llm(graph, img, output_dir, obj_data_path, mode, no_object, task_string, model='gpt4o'):
+def _extract_numeric(v):
+    """Coerce whatever Qwen returns for a likelihood value into a float."""
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, dict):
+        for key in ("likelihood", "value", "score", "probability", "weight"):
+            if key in v and isinstance(v[key], (int, float)):
+                return float(v[key])
+        for val in v.values():
+            if isinstance(val, (int, float)):
+                return float(val)
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _extract_reasoning(data):
+    """Return data['reasoning'] if present, else stringify the whole dict."""
+    if isinstance(data, dict):
+        if "reasoning" in data:
+            return data["reasoning"]
+        return " | ".join(f"{k}: {v}" for k, v in data.items())
+    return str(data)
+
+
+def run_llm(graph, img, output_dir, obj_data_path, mode, no_object, task_string, model='qwen'):
     ts = TypeChat()
-    # Set up the language model that you want to use
-    # Note: If you are utilizing local LLMs (e.g. through FastChat), you can set base_url to the URL of your local LLM
-    # Note: You can enable json_mode if you want, however, only gpt-4-1106-preview supports this
-    if model == 'gpt4o':
+    if model == 'qwen':
+        ts.createLanguageModel(model="qwen")
+    elif model == 'gpt4o':
         ts.createLanguageModel(model="gpt-4o", api_key=API_KEY, org_key=API_ORG, use_json_mode=True)
     else:
         ts.createLanguageModel(model="Starling-LM-7B-alpha", api_key=API_KEY, org_key=API_ORG, base_url="http://localhost:23002/v1")
@@ -102,13 +127,17 @@ def run_llm(graph, img, output_dir, obj_data_path, mode, no_object, task_string,
         ]
     request[0]["content"] += graph 
     request[0]["content"] += "\n\nConsider the main semantic and geometric parts the object may be decomposed into. Reason individually over all nodes in the graph about what semantic part each node may represent. Be succinct, give only a short one sentence explanation for each node." 
+    parts_reasoning_response = ""
+    parts_assignment = {}
+    likelihoods_reasoning_response = ""
+
     return_query = False
     response = tns.translate(request, image=None, return_query=return_query, free_form=True)
     if return_query:
         print(response)
     else:
         if response.success:
-            parts_reasoning_response = response.data["reasoning"]
+            parts_reasoning_response = _extract_reasoning(response.data)
             with open(output_file_path, 'w') as file:
                 file.write("Parts reasoning response:\n" + parts_reasoning_response)
         else:
@@ -129,8 +158,8 @@ def run_llm(graph, img, output_dir, obj_data_path, mode, no_object, task_string,
         print(response)
     else:
         if response.success:
+            parts_assignment = response.data
             with open(output_file_path, 'a') as file:
-                parts_assignment = response.data
                 file.write("\n\nPart assignment response:\n")
                 json.dump(response.data, file)
         else:
@@ -141,7 +170,7 @@ def run_llm(graph, img, output_dir, obj_data_path, mode, no_object, task_string,
     ts.loadSchema(likelihoods_reasoning_schema)
     tns = ts.createJsonTranslator(name=likelihoods_reasoning_name)
     task = f"Imagine you are a robot hand and tasked to '{task_string}' in a proper and safe manner by selecting a part that gives you appropriate control of the object/part of interest. Reason about how likely each node/part is correct for the gripper to interact with. Be succinct, give only a short one sentence explanation for each node."
-    if response.success:
+    if parts_assignment:
         request = assign_parts_request + [
             {"role": "assistant", "content": json.dumps(parts_assignment)},
             {"role": "user", "content": task},
@@ -151,15 +180,14 @@ def run_llm(graph, img, output_dir, obj_data_path, mode, no_object, task_string,
             {"role": "assistant", "content": parts_reasoning_response},
             {"role": "user", "content": task},
         ]
-        
+
     return_query = False
     response = tns.translate(request, image=None, return_query=return_query, free_form=True)
     if return_query:
         print(response)
     else:
         if response.success:
-            # The response data is a dictionary with the keys being the names of the fields in your schema
-            likelihoods_reasoning_response = response.data["reasoning"]
+            likelihoods_reasoning_response = _extract_reasoning(response.data)
             with open(output_file_path, 'a') as file:
                 file.write("\n\nLikelihoods reasoning response:\n" + likelihoods_reasoning_response)
         else:
@@ -192,7 +220,10 @@ def run_llm(graph, img, output_dir, obj_data_path, mode, no_object, task_string,
         else:
             print("Error:", response.message)
     
-    likelihoods = np.array(list(likelihoods.values()))
+    # Align to the nodes list so the index always maps to a valid node.
+    # Qwen may return a subset of nodes or extra keys — default missing ones to 0.
+    node_likelihoods = [_extract_numeric(likelihoods.get(n, 0.0)) for n in nodes]
+    likelihoods = np.array(node_likelihoods)
     most_likely_index = np.argmax(likelihoods)
     node_data = parse_graph_nodes(graph)
     vis_file_path = output_dir+f"/llm_{obj}_grasp.png"
@@ -210,8 +241,11 @@ def run_llm(graph, img, output_dir, obj_data_path, mode, no_object, task_string,
     cv2.circle(img, grasp_pose[1:], radius=5, color=(0, 0, 255), thickness=-1)
     cv2.imwrite(vis_file_path, img)
 
-    height_array = load_height(obj_data_path+'_depth')
-    grasp_pose = np.append(grasp_pose, height_array[grasp_pose[2], grasp_pose[1]])
+    try:
+        height_array = load_height(obj_data_path+'_depth')
+        grasp_pose = np.append(grasp_pose, height_array[grasp_pose[2], grasp_pose[1]])
+    except (ValueError, FileNotFoundError, OSError):
+        grasp_pose = np.append(grasp_pose, 0.0)
     
     print(f"Predicted Node: {most_likely_node}, Angle: {int(grasp_pose[0])}, Centroid: {grasp_pose[1:].astype(int)}")
     

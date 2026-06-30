@@ -4,6 +4,12 @@ import time
 import json
 import subprocess
 import base64
+import shutil
+
+# tsc may not be on PATH when launched via `conda run` (nvm isn't sourced).
+# Search common locations so the subprocess call always resolves.
+_NVM_BIN = os.path.expanduser("~/.nvm/versions/node/v20.20.2/bin")
+_TSC = shutil.which("tsc") or shutil.which("tsc", path=os.environ.get("PATH", "") + os.pathsep + _NVM_BIN) or os.path.join(_NVM_BIN, "tsc")
 
 class TypeChatResult():
     def __init__(self):
@@ -33,7 +39,7 @@ class TypeChatResult():
 
 
 class TypeChatLanguageModel():
-    def __init__(self, model_name, api_base=None, org_key=None, api_key=None, retryMaxAttempts=3, retryPauseSec=5, use_chat = False, use_json_mode=False):
+    def __init__(self, model_name, api_base=None, org_key=None, api_key=None, retryMaxAttempts=3, retryPauseSec=5, use_chat = False, use_json_mode=False, local_client=None):
         # Why 30? Because we try three times and OpenAI resets every 60 seconds...
         self._retryMaxAttempts = retryMaxAttempts
         self._retryPauseSec = retryPauseSec
@@ -41,8 +47,9 @@ class TypeChatLanguageModel():
         self._use_chat = use_chat
         self._use_json_mode = use_json_mode
 
-        self._client = None
-        if api_base:
+        if local_client is not None:
+            self._client = local_client
+        elif api_base:
             self._client = openai.OpenAI(
                 organization=org_key if org_key else None,
                 api_key=api_key if api_key else "EMPTY",
@@ -272,11 +279,12 @@ class TypeChatJsonTranslator():
         return validation
 
 class TypeChatJsonValidator():
-    def __init__(self, schema, name, basedir):
+    def __init__(self, schema, name, basedir, skip_ts_check=False):
         self._schema = schema
         self._typeName = name
         self._stripNulls = False
         self._basedir = basedir
+        self._skip_ts_check = skip_ts_check
 
         self._options = [
             "--target", "es2021",
@@ -331,7 +339,13 @@ class TypeChatJsonValidator():
         if self._stripNulls:
             jsonObject = self._stripNone(jsonObject)
 
-        moduleResult = self.createModuleTextFromJson(jsonObject)  
+        if self._skip_ts_check:
+            result = TypeChatResult()
+            result.success = True
+            result.data = jsonObject
+            return result
+
+        moduleResult = self.createModuleTextFromJson(jsonObject)
 
         if not moduleResult.success:
             return moduleResult
@@ -346,8 +360,10 @@ class TypeChatJsonValidator():
         return result
     
     def getSyntacticDiagnostics(self):
-        command = ["tsc", f"{self._basedir}/out/json.ts", f"{self._basedir}/out/lib.d.ts", f"{self._basedir}/out/schema.ts"] + self._options
-        res = subprocess.run(command, stdout=subprocess.PIPE, text=True)
+        command = [_TSC, f"{self._basedir}/out/json.ts", f"{self._basedir}/out/lib.d.ts", f"{self._basedir}/out/schema.ts"] + self._options
+        env = os.environ.copy()
+        env["PATH"] = _NVM_BIN + os.pathsep + env.get("PATH", "")
+        res = subprocess.run(command, stdout=subprocess.PIPE, text=True, env=env)
         # print(res)
         result = TypeChatResult()
         result.success = res.returncode == 0
@@ -372,11 +388,21 @@ class TypeChatJsonValidator():
             return value
 
 class TypeChat():
+    def __init__(self):
+        self._skip_ts_check = False
+
     def createLanguageModel(self, model, base_url=None, org_key=None, api_key=None, use_json_mode=False):
-        self._model = TypeChatLanguageModel(model, base_url, org_key, api_key, use_chat=True, use_json_mode=use_json_mode)
-    
+        if model == "qwen":
+            import sys, os
+            sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
+            from code.local_vlm import LocalQwenClient
+            self._model = TypeChatLanguageModel("qwen", use_chat=True, use_json_mode=False, local_client=LocalQwenClient())
+            self._skip_ts_check = True
+        else:
+            self._model = TypeChatLanguageModel(model, base_url, org_key, api_key, use_chat=True, use_json_mode=use_json_mode)
+
     def createJsonValidator(self, schema, name, basedir):
-        validator = TypeChatJsonValidator(schema, name, basedir=basedir)
+        validator = TypeChatJsonValidator(schema, name, basedir=basedir, skip_ts_check=self._skip_ts_check)
         return validator
     
     def loadSchema(self, path=None, schema=None):

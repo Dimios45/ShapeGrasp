@@ -65,18 +65,16 @@ def run_pipeline(obj, task_string, data_dir, iter, output_idx, mode, threshold, 
                 mode = '2d'
                 threshold = 0.15
                 hulls = decompose(mesh, output_dir, mode, data_dir, threshold)
-            num_hulls = 0
-            for hull in hulls:
-                if hull.volume >= 500:
-                    num_hulls += 1
+            def _count_valid(hs):
+                from code.graph import _vol_thresh
+                vt = _vol_thresh(hs)
+                return sum(1 for h in hs if h.volume >= vt)
+            num_hulls = _count_valid(hulls)
             while num_hulls < 2 and threshold > 0.01:
-                num_hulls = 0
                 threshold = max(threshold - 0.025, 0.01)
                 print(f"using threshold: {threshold}")
                 hulls = decompose(mesh, output_dir, mode, data_dir, threshold)
-                for hull in hulls:
-                    if hull.volume >= 500:
-                        num_hulls += 1
+                num_hulls = _count_valid(hulls)
             print(f"num parts: {len(hulls)}")
         graph, shapes = create_graph(hulls, output_dir, obj_data_path, mode, eps)
         
@@ -93,7 +91,7 @@ if __name__ == "__main__":
     parser.add_argument('-m', '--mode', type=str, default='2d', help='3d or 2d (use depth or no depth)')
     parser.add_argument('-t', '--threshold', type=float, help='Threshold value')
     parser.add_argument('--no_object', action='store_true', help='Include to run without object')
-    parser.add_argument('--model', type=str, default='gpt4o', help='LLM inference model')
+    parser.add_argument('--model', type=str, default='qwen', help='LLM inference model (qwen, gpt4o, starling)')
     parser.add_argument('--eps', type=float, default=0.015, help='epsilon for shape approximation')
     args = parser.parse_args()
     try:
